@@ -12,6 +12,10 @@ from googleapiclient.discovery import build
 
 app = FastAPI()
 
+# ------------------------------------------------
+# SHOP CONFIG
+# ------------------------------------------------
+
 class ShopConfig(BaseModel):
     id: str
     name: str
@@ -36,13 +40,17 @@ def get_shop(request: Request) -> ShopConfig:
         raise HTTPException(status_code=403, detail="Invalid or missing shop token")
     return SHOPS_BY_TOKEN[token]
 
+
+# ------------------------------------------------
+# GOOGLE CALENDAR INTEGRATION
+# ------------------------------------------------
+
 def get_calendar_service():
     sa_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not sa_path or not os.path.exists(sa_path):
         return None
     creds = service_account.Credentials.from_service_account_file(
-        sa_path,
-        scopes=["https://www.googleapis.com/auth/calendar"],
+        sa_path, scopes=["https://www.googleapis.com/auth/calendar"]
     )
     return build("calendar", "v3", credentials=creds)
 
@@ -59,11 +67,15 @@ def create_calendar_event(shop: ShopConfig, start_dt, end_dt, phone):
     }
 
     created = service.events().insert(
-        calendarId=shop.calendar_id,
-        body=event
+        calendarId=shop.calendar_id, body=event
     ).execute()
 
     return created.get("id")
+
+
+# ------------------------------------------------
+# AI DAMAGE ESTIMATE
+# ------------------------------------------------
 
 async def estimate_damage_from_image(media_url: str, shop: ShopConfig):
     api_key = os.getenv("OPENAI_API_KEY")
@@ -77,15 +89,13 @@ async def estimate_damage_from_image(media_url: str, shop: ShopConfig):
     )
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
     payload = {
         "model": "gpt-4.1-mini",
         "messages": [
             {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": [{"type": "image_url", "image_url": {"url": media_url}}],
-            },
+            {"role": "user", 
+             "content": [{"type": "image_url", "image_url": {"url": media_url}}]
+            }
         ],
         "response_format": {"type": "json_object"},
     }
@@ -97,9 +107,7 @@ async def estimate_damage_from_image(media_url: str, shop: ShopConfig):
                 headers=headers,
                 json=payload,
             )
-
         parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
-
         severity = parsed.get("severity", "Moderate")
         min_cost = parsed.get("min_cost")
         max_cost = parsed.get("max_cost")
@@ -114,17 +122,27 @@ async def estimate_damage_from_image(media_url: str, shop: ShopConfig):
     except:
         return "Moderate", "$450–$1,200"
 
+
+# ------------------------------------------------
+# APPOINTMENT SLOTS
+# ------------------------------------------------
+
 def get_appointment_slots(n: int = 3):
     now = datetime.datetime.now()
     tomorrow = now + datetime.timedelta(days=1)
     hours = [9, 11, 14, 16]
-
     slots = []
+
     for h in hours:
-        t = tomorrow.replace(hour=h, minute=0, second=0, microsecond=0)
-        if t > now:
-            slots.append(t)
+        slot = tomorrow.replace(hour=h, minute=0, second=0, microsecond=0)
+        if slot > now:
+            slots.append(slot)
     return slots[:n]
+
+
+# ------------------------------------------------
+# ROUTES
+# ------------------------------------------------
 
 @app.get("/")
 def root():
@@ -141,6 +159,9 @@ async def sms_webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
     session_key = f"{shop.id}:{from_number}"
     session = SESSIONS.get(session_key)
 
+    # ----------------------------
+    # BOOKING SELECTION (1,2,3)
+    # ----------------------------
     if session and session.get("awaiting_time") and body in {"1", "2", "3"}:
         idx = int(body) - 1
         slots = session["slots"]
@@ -156,8 +177,7 @@ async def sms_webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
             )
 
             reply.message(
-                f"Great, {shop.name} has booked you for "
-                f"{chosen.strftime('%a %b %d at %I:%M %p')}."
+                f"Great, {shop.name} has booked you for {chosen.strftime('%a %b %d at %I:%M %p')}."
             )
 
             session["awaiting_time"] = False
@@ -165,6 +185,9 @@ async def sms_webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
 
             return Response(content=str(reply), media_type="application/xml")
 
+    # ----------------------------
+    # AI IMAGE ESTIMATE
+    # ----------------------------
     if media_url:
         severity, cost_range = await estimate_damage_from_image(media_url, shop)
         slots = get_appointment_slots()
@@ -182,16 +205,17 @@ async def sms_webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
         for i, s in enumerate(slots, 1):
             lines.append(f"{i}) {s.strftime('%a %b %d at %I:%M %p')}")
 
-        reply.message("
-".join(lines))
+        reply.message("\n".join(lines))
         return Response(content=str(reply), media_type="application/xml")
 
+    # ----------------------------
+    # DEFAULT RESPONSE
+    # ----------------------------
     intro = [
         f"Thanks for messaging {shop.name}! 👋",
         "",
         "Send a clear photo of the damage to receive an AI estimate.",
     ]
 
-    reply.message("
-".join(intro))
+    reply.message("\n".join(intro))
     return Response(content=str(reply), media_type="application/xml")
